@@ -1,11 +1,10 @@
 package main
 
 import (
-	. "eaciit/storaenso/processapp/duplicatematl"
 	"fmt"
-	ts "github.com/eaciit/textsearch"
+	"github.com/eaciit/pque"
 	tk "github.com/eaciit/toolkit"
-	"sync"
+	. "github.com/juragan360/storaenso/duplicatematl"
 	"time"
 )
 
@@ -26,136 +25,66 @@ func main() {
 	tBuildIndex := time.Now()
 	var matrefs []tk.M
 	copy(mats, matrefs)
-	byNames := make(map[string][]float64, 0)
+
+	byId := make(map[string][]string, 0)
+	byNames := make(map[string][]string, 0)
 
 	exactNameCount := 0
 	fmt.Print("2. Build index ... ")
 	for _, matl := range mats {
 		matName := matl["Trimmed"].(string)
-		matId := matl["_id"].(float64)
+		matId := matl["Matnr"].(string)
 		if _, byNameExist := byNames[matName]; !byNameExist {
-			byNames[matName] = []float64{matId}
+			byNames[matName] = []string{matId}
+			byId[matId] = []string{matId}
 		} else {
-			byNames[matName] = append(byNames[matName], matId)
-			exactNameCount++
+			firstId := byNames[matName][0]
+			if firstId != matId {
+				byNames[matName] = append(byNames[matName], matId)
+				copy(byId[byNames[matName][0]], byNames[matName])
+				if len(byNames[matName]) == 2 {
+					exactNameCount++
+				}
+			}
 		}
 	}
 	fmt.Printf("Done (%v). Found %d index, %d are duplicated using exactly same description\n",
 		time.Since(tBuildIndex), len(byNames), exactNameCount)
 
-	final := tk.M{}
-	tSimilarity := time.Now()
-	fmt.Println("3. Get by similarity group ... ")
-	wg := new(sync.WaitGroup)
-	for _, matl := range mats {
-		wg.Add(1)
-		go getSimilarity_0(matl, &mats, &final, wg)
+	fmt.Println("3. Saving data ... ")
+	tSave := time.Now()
+	recordCount := len(byNames)
+	DbCtx().Connection.Query().From("Items").Delete().Run(nil)
+	que := pque.NewQue()
+	que.WorkerCount = 50
+	que.Fn = func(in interface{}) interface{} {
+		m := in.(tk.M)
+		DbCtx().Connection.Query().From("Items").Save().Run(tk.M{"data": m})
+		return m
 	}
-	wg.Wait()
-	/*
-		inloop := true
-		idxLoop := 0
-			for inloop && idxLoop < 10 {
-				if len(mats) > 0 {
-					matl := mats[idxLoop]
-					findSimilarity(matl, &mats, &final)
-				} else {
-					inloop = false
-				}
-				idxLoop++
-			}
-	*/
-	fmt.Printf("Done (%v). \n", time.Since(tSimilarity))
-	fmt.Printf("All process completed in %v \n", time.Since(tStart))
-}
-
-func getSimilarity_0(find tk.M, compareToP *[]tk.M, resultP *tk.M, wg *sync.WaitGroup) {
-	matName := find["Trimmed"].(string)
-	matId := find["_id"].(float64)
-	tstart := time.Now()
-	fmt.Printf("Find similarity for %v - %s \n", matId, matName)
-	results := *resultP
-	cs := *compareToP
-
-	for _, _ = range cs {
-		//cname := c["Trimmed"].(string)
-		//cid := c["_id"].(float64)
-		s := ts.NewSimilaritySetting()
-		s.SplitDelimeters = []rune{' ', '-', '.'}
-		//if ts.Similarity(matName, cname, s) >= 80 {
-		//		//break
-		//}
+	que.FnDone = func(in interface{}) {
+		m := in.(tk.M)
+		fmt.Printf("Saving %s, completed: %3.1f pct \n", m["title"], float64(que.CompletedJob*100)/float64(recordCount))
 	}
 
-	fmt.Printf("Done for %v - %s in %v. Collected similar items: %d. Remaining items: %d \n",
-		matId, matName,
-		time.Since(tstart),
-		0,
-		//len(results[matName].([]float64)),
-		len(cs))
-
-	//*compareToP = cs
-	*resultP = results
-	wg.Done()
-}
-
-func findSimilarity(find tk.M, compareToP *[]tk.M, resultP *tk.M) {
-	results := *resultP
-	cs := *compareToP
-
-	matName := find["Trimmed"].(string)
-	matId := find["_id"].(float64)
-	tstart := time.Now()
-	fmt.Printf("Find similarity for %v - %s ... ", matId, matName)
-
-	results[matName] = make([]float64, 0)
-	idx := 0
-	inloop := true
-	for inloop {
-		if idx == 0 {
-			fmt.Printf("El 0: %v == %v \n", find, cs[0])
-		}
-		idx++
-		if idx > len(cs) && len(cs) > 0 {
-			inloop = false
+	que.WaitForKeys()
+	for matname, ids := range byNames {
+		m := tk.M{}
+		m.Set("_id", ids[0])
+		m.Set("title", matname)
+		if len(ids) == 1 {
+			m.Set("duplicated", 0)
 		} else {
-			//fmt.Printf("Len S now: %d \n", len(cs))
-			c := cs[0]
-			cName := c["Trimmed"].(string)
-			cId := c["_id"].(float64)
-			if cId == matId {
-				addSimilarity(0, &results, &cs)
-			} else {
-				s := ts.NewSimilaritySetting()
-				s.SplitDelimeters = []rune{' ', '-', '.'}
-				if ts.Similarity(matName, cName, s) >= 80 {
-					addSimilarity(0, &results, &cs)
-				}
-			}
+			m.Set("duplicated", 1)
+			m.Set("duplicateid", ids[1:])
 		}
+		que.SendKey(m)
 	}
-	fmt.Printf("Done in %v. Collected similar items: %d. Remaining items: %d \n",
-		time.Since(tstart),
-		len(results[matName].([]float64)),
-		len(cs))
+	que.KeySendDone()
+	que.WaitForCompletion()
 
-	*compareToP = cs
-	*resultP = results
-}
+	fmt.Printf("Saving %d records in %v \n", que.CompletedJob, time.Since(tSave))
 
-func addSimilarity(idx int, outP *tk.M, sourceP *[]tk.M) {
-	out := *outP
-	source := *sourceP
-
-	matl := source[idx]
-	name := matl["Trimmed"].(string)
-	id := matl["_id"].(float64)
-	if _, b := out[name]; !b {
-		out[name] = make([]float64, 0)
-	}
-	out[name] = append(out[name].([]float64), id)
-	source = append(source[:idx], source[idx+1:]...)
-
-	*outP = out
-	*sourceP = source
+	//FindSimilarity_1(mats)
+	fmt.Printf("All process completed in %v \n", time.Since(tStart))
 }
